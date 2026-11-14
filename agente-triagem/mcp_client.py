@@ -2,10 +2,26 @@
 from __future__ import annotations
 import asyncio
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 from mcp import ClientSession
 from config import AGENT_NAME, MAX_RETRIES, READ_TIMEOUT_SECONDS, log
 from dashboard import STORE
+
+CURRENT_ACTOR: ContextVar[str] = ContextVar("current_actor", default=AGENT_NAME)
+CURRENT_REASON: ContextVar[str] = ContextVar("current_reason", default="Ação operacional de triagem.")
+
+
+@contextmanager
+def action_context(actor: str, reason: str):
+    actor_token = CURRENT_ACTOR.set(actor)
+    reason_token = CURRENT_REASON.set(reason)
+    try:
+        yield
+    finally:
+        CURRENT_ACTOR.reset(actor_token)
+        CURRENT_REASON.reset(reason_token)
 
 
 async def _reconcile_write(
@@ -107,12 +123,26 @@ async def call_tool(
             if name == "proximo_evento" and payload.get("evento"):
                 STORE.record_event(payload["evento"])
             if event_id:
-                STORE.record_action(event_id, name, arguments, payload)
+                STORE.record_action(
+                    event_id,
+                    name,
+                    arguments,
+                    payload,
+                    actor=CURRENT_ACTOR.get(),
+                    reason=CURRENT_REASON.get(),
+                )
             return payload
         except MCPToolError as error:
             last_error = error
             if event_id and (error.codigo >= 500 or error.codigo == 409):
-                STORE.record_action(event_id, name, arguments, error=f"{error.codigo}: {error.mensagem}")
+                STORE.record_action(
+                    event_id,
+                    name,
+                    arguments,
+                    error=f"{error.codigo}: {error.mensagem}",
+                    actor=CURRENT_ACTOR.get(),
+                    reason=CURRENT_REASON.get(),
+                )
             if not read_only and error.codigo in (409, 504):
                 reconciled = await _reconcile_write(session, name, arguments)
                 if reconciled is not None:
@@ -122,6 +152,8 @@ async def call_tool(
                         "reconcile_write",
                         arguments,
                         reconciled,
+                        actor=CURRENT_ACTOR.get(),
+                        reason="Reconciliação após erro de escrita.",
                     )
                     return reconciled
             retryable = error.codigo == 503 or error.codigo == 409 or (read_only and error.codigo == 504)
@@ -136,7 +168,14 @@ async def call_tool(
                 reconciled = await _reconcile_write(session, name, arguments)
                 if reconciled is not None:
                     log.warning("%s: ação já aplicada após timeout; não repetirei a escrita.", name)
-                    STORE.record_action(event_id, "reconcile_write", arguments, reconciled)
+                    STORE.record_action(
+                        event_id,
+                        "reconcile_write",
+                        arguments,
+                        reconciled,
+                        actor=CURRENT_ACTOR.get(),
+                        reason="Reconciliação após timeout de escrita.",
+                    )
                     return reconciled
             if attempt == MAX_RETRIES - 1 or not read_only:
                 raise last_error

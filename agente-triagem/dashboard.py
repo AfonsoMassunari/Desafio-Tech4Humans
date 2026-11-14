@@ -9,7 +9,7 @@ import threading
 from copy import deepcopy
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from config import AGENT_DASHBOARD_PATH, AGENT_REVIEW_PATH
@@ -17,6 +17,14 @@ from config import AGENT_DASHBOARD_PATH, AGENT_REVIEW_PATH
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+REVIEW_DISPATCHER: Callable[[str, str], dict[str, Any]] | None = None
+
+
+def set_review_dispatcher(dispatcher: Callable[[str, str], dict[str, Any]]) -> None:
+    global REVIEW_DISPATCHER
+    REVIEW_DISPATCHER = dispatcher
 
 
 class DashboardStore:
@@ -80,6 +88,14 @@ class DashboardStore:
         with open(temporary, "w", encoding="utf-8") as file:
             json.dump(list(self._reviews.values()), file, ensure_ascii=False, indent=2)
         os.replace(temporary, self.review_path)
+
+    def reset_runtime(self) -> None:
+        """Inicia uma execução limpa sem apagar a memória histórica do agente."""
+        with self._lock:
+            self._events.clear()
+            self._reviews.clear()
+            self._persist_locked()
+            self._persist_reviews_locked()
 
     def record_event(self, event: dict[str, Any]) -> None:
         event_id = str(event.get("id", ""))
@@ -202,6 +218,7 @@ class DashboardStore:
             if review is None:
                 return None
             review["corrected_response"] = message[:2000]
+            review["llm_response"] = message[:2000]
             review["status"] = "pending"
             review["reason"] = "Resposta refeita pelo modelo e aguardando aprovação humana."
             review["updated_at"] = _now()
@@ -245,6 +262,8 @@ class DashboardStore:
                 "human_review",
                 {"status": status, "comment": comment[:2000], "message": message[:2000]},
                 {"status": status, "corrected_response": message[:2000]},
+                actor="HumanReview",
+                reason="Registrar a decisão e a resposta revisada pela pessoa responsável.",
             )
             return deepcopy(review)
 
@@ -255,6 +274,8 @@ class DashboardStore:
         arguments: dict[str, Any],
         result: dict[str, Any] | None = None,
         error: str | None = None,
+        actor: str = "Dashboard",
+        reason: str = "Ação registrada no painel.",
     ) -> None:
         if not event_id:
             return
@@ -273,6 +294,8 @@ class DashboardStore:
             action: dict[str, Any] = {
                 "at": _now(),
                 "tool": tool,
+                "agent": actor,
+                "reason": reason,
                 "arguments": deepcopy({k: v for k, v in arguments.items() if k != "agente"}),
             }
             if result is not None:
@@ -383,28 +406,46 @@ button { cursor:pointer; font-weight:700; } button.approve { background:#166534;
 .review { background:#182231; border:1px solid #2d3b4e; border-radius:10px; margin:12px 0; padding:16px; }
 .head { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
 .pill { border-radius:20px; padding:4px 9px; background:#29425d; font-size:12px; }
+.review-status { display:inline-flex; align-items:center; gap:6px; margin-top:7px; padding:6px 10px; border-radius:999px; font-size:12px; font-weight:800; letter-spacing:.03em; border:1px solid; }
+.review-status::before { content:""; width:8px; height:8px; border-radius:50%; background:currentColor; }
+.review-status.pending { color:#facc15; background:#422006; border-color:#facc15; }
+.review-status.approved { color:#4ade80; background:#052e16; border-color:#4ade80; }
+.review-status.rejected { color:#f87171; background:#450a0a; border-color:#f87171; }
+.review-status.needs-info { color:#fb923c; background:#431407; border-color:#fb923c; }
+.review-status.not-requested { color:#cbd5e1; background:#1e293b; border-color:#64748b; }
 .p0 { color:#ff6b6b; font-weight:700; } .p1 { color:#ffb454; font-weight:700; } .security { color:#d8b4fe; font-weight:700; }
 pre { white-space:pre-wrap; color:#c9d5e3; font-size:12px; background:#131b27; padding:10px; border-radius:6px; }
+.llm-version { background:#172554; border:2px solid #60a5fa; color:#dbeafe; }
 textarea { width:100%; min-height:70px; box-sizing:border-box; margin:10px 0; }
-.actions { display:flex; gap:8px; flex-wrap:wrap; } .muted { color:#9eacbd; font-size:13px; }
+.actions { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; margin-top:16px; padding:16px; background:#0b1220; border:2px solid #475569; border-radius:10px; } .actions::before { content:"AÇÕES DA REVISÃO HUMANA"; grid-column:1/-1; color:#cbd5e1; font-size:12px; font-weight:800; letter-spacing:.08em; } .actions button { min-height:50px; padding:14px 18px; font-size:15px; border-width:2px; box-shadow:0 3px 8px rgba(0,0,0,.3); } button:hover { filter:brightness(1.2); transform:translateY(-1px); } button:disabled { cursor:wait; opacity:.55; transform:none; } button.approve { background:#15803d; border-color:#4ade80; } button.reject { background:#b91c1c; border-color:#f87171; } button.info { background:#a16207; border-color:#facc15; } button.llm { background:#1d4ed8; border-color:#60a5fa; } .muted { color:#9eacbd; font-size:13px; }
 </style>
 </head>
 <body>
 <header><h1>Revisão humana</h1><div class="muted">Revise manualmente qualquer resposta emitida pelo agente ou trate casos críticos</div></header>
 <main>
-<div class="toolbar"><select id="status"><option value="">Todas</option><option value="pending">Pendentes</option><option value="approved">Aprovadas</option><option value="rejected">Rejeitadas</option><option value="needs_info">Aguardando informação</option></select><a href="/agents" class="muted">Voltar ao painel de agentes</a></div>
+<div class="toolbar"><select id="status"><option value="">Todas</option><option value="pending">Pendentes</option><option value="approved">Aprovadas</option><option value="rejected">Rejeitadas</option><option value="needs_info">Aguardando informação</option></select><button type="button" onclick="load().catch(error=>alert(error.message))">Atualizar</button><a href="/agents" class="muted">Voltar ao painel de agentes</a></div>
 <div id="reviews"></div>
 </main>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const json=x=>esc(JSON.stringify(x,null,2));
-let records=[], events=[];
+let records=[], events=[], loading=false;
 function responseOf(item){
   const actions=item.actions||[];
   const response=[...actions].reverse().find(x=>x.tool==='responder_evento');
   if(!response) return null;
   const reviewed=[...actions].reverse().find(x=>x.tool==='review_response');
   return {original:response.arguments?.mensagem||'', reviewed:reviewed?.result?.reviewed||response.arguments?.mensagem||''};
+}
+function statusPresentation(status){
+  const values={
+    pending:['Pendente','pending'],
+    approved:['Aprovada','approved'],
+    rejected:['Recusada','rejected'],
+    needs_info:['Aguardando informação','needs-info'],
+    not_requested:['Não enviada para revisão','not-requested']
+  };
+  return values[status]||['Status desconhecido','not-requested'];
 }
 function render(){
   const status=document.querySelector('#status').value;
@@ -415,31 +456,54 @@ function render(){
     const severity=review?.decision?.categoria||item.severity||'MANUAL';
     const current=review?.corrected_response||response.reviewed||response.original;
     const reviewStatus=review?.status||'not_requested';
-    const controls=`<textarea id="message-${esc(item.id)}">${esc(current)}</textarea><textarea id="comment-${esc(item.id)}" placeholder="Observação ou orientação humana">${esc(review?.comment||'')}</textarea><div class="actions"><button class="info" onclick="requestReview('${esc(item.id)}')">Colocar na fila</button><button class="llm" onclick="reprocess('${esc(item.id)}')">Refazer com LLM</button><button class="approve" onclick="decide('${esc(item.id)}','approved')">Aprovar resposta</button><button class="reject" onclick="decide('${esc(item.id)}','rejected')">Rejeitar resposta</button><button class="info" onclick="decide('${esc(item.id)}','needs_info')">Pedir informação</button></div>`;
-    return `<article class="review"><div class="head"><div><strong>${esc(item.id)}</strong> — ${esc(item.event?.assunto||'(sem assunto)')}<div class="muted">Status: ${esc(reviewStatus)} · agentes: ${esc((item.agents||[]).join(', '))}</div></div><div class="${severity.toLowerCase()}">${esc(severity)}</div></div><h3>Resposta original do agente</h3><pre>${esc(response.original)}</pre><h3>Resposta revisada pelo ReviewerAgent</h3><pre>${esc(response.reviewed)}</pre><h3>Revisão manual</h3>${controls}</article>`;
+    const [statusLabel,statusClass]=statusPresentation(reviewStatus);
+    const llmVersion=review?.llm_response?`<h3>Nova resposta gerada pelo LLM</h3><pre class="llm-version">${esc(review.llm_response)}</pre>`:'';
+    const controls=`<textarea id="message-${esc(item.id)}">${esc(current)}</textarea><textarea id="comment-${esc(item.id)}" placeholder="Observação ou orientação para o LLM">${esc(review?.comment||'')}</textarea><div class="actions"><button class="llm" onclick="reprocess('${esc(item.id)}')">Refazer com LLM</button><button class="approve" onclick="decide('${esc(item.id)}','approved')">Aprovar resposta</button><button class="reject" onclick="decide('${esc(item.id)}','rejected')">Rejeitar resposta</button></div>`;
+    return `<article class="review"><div class="head"><div><strong>${esc(item.id)}</strong> — ${esc(item.event?.assunto||'(sem assunto)')}<div><span class="review-status ${statusClass}">${statusLabel}</span></div><div class="muted">Agentes: ${esc((item.agents||[]).join(', '))}</div></div><div class="${severity.toLowerCase()}">${esc(severity)}</div></div><h3>Resposta original do agente</h3><pre>${esc(response.original)}</pre><h3>Resposta revisada pelo ReviewerAgent</h3><pre>${esc(response.reviewed)}</pre>${llmVersion}<h3>Revisão manual</h3>${controls}</article>`;
   }).join('')||'<p class="muted">Nenhuma resposta encontrada para este filtro.</p>';
 }
 async function load(){
-  const result=await Promise.all([fetch('/api/reviews',{cache:'no-store'}),fetch('/api/agents',{cache:'no-store'})]);
-  records=await result[0].json(); events=await result[1].json(); render();
+  if(loading) return;
+  loading=true;
+  try {
+    const result=await Promise.all([fetch('/api/reviews',{cache:'no-store'}),fetch('/api/agents',{cache:'no-store'})]);
+    if(!result[0].ok || !result[1].ok) throw new Error('Não foi possível carregar a fila de revisão.');
+    records=await result[0].json(); events=await result[1].json(); render();
+  } finally { loading=false; }
+}
+async function reviewRequest(eventId, payload){
+  const response=await fetch('/api/reviews/'+encodeURIComponent(eventId),{
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
+  });
+  const body=await response.text();
+  let detail=body;
+  try { detail=JSON.parse(body).message||JSON.parse(body).error||body; } catch (_) {}
+  if(!response.ok) throw new Error(detail||`HTTP ${response.status}`);
+  return body ? JSON.parse(body) : {};
+}
+async function runAction(eventId, action){
+  const messageField=document.getElementById('message-'+eventId);
+  const buttons=messageField?.parentElement?.querySelectorAll('.actions button')||[];
+  buttons.forEach(button=>button.disabled=true);
+  try { await action(); await load(); }
+  catch(error) { alert(`Não foi possível concluir a revisão: ${error.message}`); }
+  finally { buttons.forEach(button=>button.disabled=false); }
 }
 async function requestReview(eventId){
-  await fetch('/api/reviews/'+encodeURIComponent(eventId),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'request'})});
-  await load();
+  await runAction(eventId,()=>reviewRequest(eventId,{action:'request'}));
 }
 async function decide(eventId,status){
   const comment=document.querySelector('#comment-'+eventId)?.value||'';
   const message=document.querySelector('#message-'+eventId)?.value||'';
-  await fetch('/api/reviews/'+encodeURIComponent(eventId),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,comment,message})});
-  await load();
+  await runAction(eventId,()=>reviewRequest(eventId,{status,comment,message}));
 }
 async function reprocess(eventId){
   const message=document.querySelector('#message-'+eventId)?.value||'';
-  const response=await fetch('/api/reviews/'+encodeURIComponent(eventId),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'reprocess',message})});
-  if(!response.ok){ alert('Não foi possível chamar o modelo novamente.'); return; }
-  await load();
+  const comment=document.querySelector('#comment-'+eventId)?.value||'';
+  await runAction(eventId,()=>reviewRequest(eventId,{action:'reprocess',message,comment}));
 }
-document.querySelector('#status').addEventListener('change',render); load(); setInterval(load,5000);
+document.querySelector('#status').addEventListener('change',render);
+load().catch(error=>alert(error.message));
 </script>
 </body>
 </html>"""
@@ -492,16 +556,40 @@ class _Handler(BaseHTTPRequestHandler):
                     message = str(payload.get("message", "")).strip()
                     if not message:
                         raise ValueError("message é obrigatório para refazer a resposta")
+                    comment = str(payload.get("comment", "")).strip()
                     rewritten = asyncio.run(
-                        ReviewerAgent().review(event_record.get("event") or {}, message)
+                        ReviewerAgent().review(
+                            event_record.get("event") or {},
+                            message,
+                            guidance=comment,
+                        )
                     )
                     review = STORE.set_reprocessed_response(event_id, rewritten)
             else:
+                status = str(payload.get("status", ""))
+                message = str(payload.get("message", ""))
+                if status not in ("approved", "rejected", "needs_info"):
+                    raise ValueError("status inválido")
+                if STORE.event_snapshot(event_id) is None:
+                    self.send_error(404, "evento não encontrado")
+                    return
+                # A tela lista respostas que ainda não foram colocadas na fila.
+                # Qualquer decisão manual deve criar a revisão implicitamente.
+                if not STORE.reviews_snapshot() or not any(
+                    item.get("event_id") == event_id for item in STORE.reviews_snapshot()
+                ):
+                    STORE.request_event_review(event_id)
+                if status == "approved" and message and REVIEW_DISPATCHER is not None:
+                    try:
+                        REVIEW_DISPATCHER(event_id, message)
+                    except Exception as error:
+                        self.send_error(502, f"Não foi possível enviar a resposta aprovada: {error}")
+                        return
                 review = STORE.update_review(
                     event_id,
-                    str(payload.get("status", "")),
+                    status,
                     str(payload.get("comment", "")),
-                    str(payload.get("message", "")),
+                    message,
                 )
             if review is None:
                 self.send_error(404)

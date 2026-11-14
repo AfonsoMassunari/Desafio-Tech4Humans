@@ -15,7 +15,7 @@ from agents.routing_agent import RoutingAgent
 from agents.security_agent import SecurityAgent
 from agents.ticket_agent import TicketAgent
 from agents.vacation_agent import VacationAgent
-from mcp_client import call_tool
+from mcp_client import MCPToolError, action_context, call_tool
 from memory import AgentMemory
 from utils import normalize_key
 
@@ -86,7 +86,13 @@ class TriageAgent:
 
         if self.classifier is None:
             raise RuntimeError("Classificador não inicializado.")
-        decision = await self.classifier.classify(event)
+        classification_event = await self._with_parent_context(event)
+        decision = await self.classifier.classify(classification_event)
+        if event.get("responde_a"):
+            decision.motivo = (
+                f"Continuação de {event['responde_a']}. "
+                f"{decision.motivo}".strip()
+            )
         handler_name = {
             "faq": "FaqAgent",
             "security": "SecurityAgent",
@@ -116,4 +122,38 @@ class TriageAgent:
             if self.ticket_agent is None:
                 raise RuntimeError("Agente de chamados não inicializado.")
             handler = self.ticket_agent
-        await handler.handle(event, decision)
+        with action_context(
+            handler_name,
+            f"Executar a trilha '{decision.trilha}' após classificação do evento.",
+        ):
+            await handler.handle(event, decision)
+
+    async def _with_parent_context(self, event: dict[str, Any]) -> dict[str, Any]:
+        parent_id = str(event.get("responde_a") or "").strip()
+        if not parent_id:
+            return event
+        try:
+            result = await call_tool(
+                self.context.session,
+                "consultar",
+                read_only=True,
+                base="eventos",
+                filtro={"id": parent_id},
+                limite=1,
+            )
+        except MCPToolError as error:
+            log.warning(
+                "Não foi possível carregar o evento pai %s para %s: %s - %s",
+                parent_id,
+                event["id"],
+                error.codigo,
+                error.mensagem,
+            )
+            return event
+        parent = next(iter(result.get("registros", [])), None)
+        if not parent:
+            return event
+        merged = dict(event)
+        merged["assunto"] = f"{parent.get('assunto', '')} | {event.get('assunto', '')}"
+        merged["corpo"] = f"{parent.get('corpo', '')}\n\nResposta recebida:\n{event.get('corpo', '')}"
+        return merged

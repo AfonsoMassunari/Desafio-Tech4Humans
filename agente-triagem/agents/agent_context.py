@@ -8,7 +8,7 @@ from mcp import ClientSession
 from config import AGENT_NAME, DOMINIO_EMPRESA, log
 from agents.reviewer_agent import ReviewerAgent
 from dashboard import STORE
-from mcp_client import call_tool
+from mcp_client import action_context, call_tool
 
 
 class AgentContext:
@@ -25,12 +25,15 @@ class AgentContext:
 
     async def respond(self, event: dict[str, Any], message: str, *, wait: bool = False) -> None:
         reviewed_message = await self.reviewer.review(event, message)
-        STORE.record_action(
-            event["id"],
-            "review_response",
-            {"original": message[:2000]},
-            {"reviewed": reviewed_message[:2000], "agent": "ReviewerAgent"},
-        )
+        with action_context("ReviewerAgent", "Revisar a resposta antes do envio ao solicitante."):
+            STORE.record_action(
+                event["id"],
+                "review_response",
+                {"original": message[:2000]},
+                {"reviewed": reviewed_message[:2000], "agent": "ReviewerAgent"},
+                actor="ReviewerAgent",
+                reason="Revisar clareza, segurança e preservação dos dados do caso.",
+            )
         await call_tool(
             self.session,
             "responder_evento",

@@ -6,8 +6,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from triage_agent import TriageAgent
 from config import AGENT_DASHBOARD_PORT, EVENT_POLL_TIMEOUT_SECONDS, ESPERAR_SEGUNDOS_EVENTO, MCP_URL, LLM_MODEL, log
-from dashboard import start_dashboard
-from mcp_client import MCPToolError, call_tool
+from dashboard import set_review_dispatcher, start_dashboard
+from mcp_client import MCPToolError, action_context, call_tool
 
 async def run() -> None:
     start_dashboard(port=AGENT_DASHBOARD_PORT)
@@ -16,6 +16,26 @@ async def run() -> None:
     async with streamable_http_client(MCP_URL) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
+            loop = asyncio.get_running_loop()
+
+            def dispatch_human_response(event_id: str, message: str) -> dict[str, object]:
+                async def send() -> dict[str, object]:
+                    with action_context(
+                        "HumanReview",
+                        "Enviar a resposta corrigida após aprovação humana.",
+                    ):
+                        return await call_tool(
+                            session,
+                            "responder_evento",
+                            evento_id=event_id,
+                            mensagem=message,
+                            aguardar_resposta=False,
+                        )
+
+                future = asyncio.run_coroutine_threadsafe(send(), loop)
+                return future.result(timeout=60)
+
+            set_review_dispatcher(dispatch_human_response)
             agent = TriageAgent(session)
             await agent.load_reference_data()
             log.info("Agente de triagem conectado e pronto.")

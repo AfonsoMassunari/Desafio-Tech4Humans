@@ -22,7 +22,13 @@ class ReviewerAgent:
             else None
         )
 
-    async def review(self, event: dict[str, Any], message: str) -> str:
+    async def review(
+        self,
+        event: dict[str, Any],
+        message: str,
+        *,
+        guidance: str = "",
+    ) -> str:
         if self.client is None:
             return message
         prompt = (
@@ -32,7 +38,8 @@ class ReviewerAgent:
             "de dados obrigatórios e não inclua dados pessoais desnecessários. "
             "Se a resposta já estiver adequada, devolva-a sem mudanças.\n\n"
             f"Assunto: {event.get('assunto', '')}\n"
-            f"Resposta: {message[:2000]}"
+            f"Resposta: {message[:2000]}\n"
+            f"Orientação humana: {guidance[:1000] or 'Nenhuma orientação adicional.'}"
         )
         try:
             result = await self.client.chat.completions.create(
